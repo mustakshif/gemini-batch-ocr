@@ -495,16 +495,23 @@ class GeminiOCRProcessor:
     # Batch API 方法
     # ========================================================================
     
+    def _safe_ascii_name(self, name: str) -> str:
+        import hashlib
+        if name.isascii():
+            return name
+        hash_suffix = hashlib.md5(name.encode('utf-8')).hexdigest()[:8]
+        return f"pdf_{hash_suffix}"
+    
     def image_to_base64(self, image: Image.Image) -> str:
         import io
         buffer = io.BytesIO()
         image.save(buffer, format='PNG')
         return base64.b64encode(buffer.getvalue()).decode('utf-8')
     
-    def prepare_batch_request(self, image: Image.Image, pdf_name: str, page_num: int) -> Dict:
+    def prepare_batch_request(self, image: Image.Image, safe_pdf_id: str, page_num: int) -> Dict:
         image_b64 = self.image_to_base64(image)
         return {
-            "key": f"{pdf_name}_page_{page_num:04d}",
+            "key": f"{safe_pdf_id}_page_{page_num:04d}",
             "request": {
                 "contents": [{
                     "parts": [
@@ -525,10 +532,11 @@ class GeminiOCRProcessor:
     
     def upload_jsonl_file(self, file_path: Path) -> str:
         self.logger.info(f"上传文件到 File API: {file_path.name}")
+        safe_display_name = file_path.stem.encode('ascii', 'replace').decode('ascii')
         uploaded = self.client.files.upload(
             file=str(file_path),
             config=types.UploadFileConfig(
-                display_name=file_path.stem,
+                display_name=safe_display_name,
                 mime_type='application/jsonl'
             )
         )
@@ -539,10 +547,11 @@ class GeminiOCRProcessor:
     
     def submit_batch_job(self, file_name: str, display_name: str) -> str:
         self.logger.info(f"提交 Batch Job: {display_name}")
+        safe_display_name = display_name.encode('ascii', 'replace').decode('ascii')
         batch_job = self.client.batches.create(
             model=self.config.model_name,
             src=file_name,
-            config={'display_name': display_name}
+            config={'display_name': safe_display_name}
         )
         if not batch_job.name:
             raise RuntimeError("Batch job creation failed: no name returned")
@@ -620,6 +629,7 @@ class GeminiOCRProcessor:
     
     def process_pdf_batch(self, pdf_path: Path, job_manager: BatchJobManager) -> Optional[str]:
         pdf_name = pdf_path.name
+        safe_pdf_id = self._safe_ascii_name(pdf_path.stem)
         self.logger.info(f"[Batch模式] 开始处理: {pdf_name}")
         
         images = self.pdf_to_images(pdf_path)
@@ -645,15 +655,15 @@ class GeminiOCRProcessor:
             batch_requests = []
             for page_num in range(page_start, page_end + 1):
                 image = images[page_num - 1]
-                req = self.prepare_batch_request(image, pdf_name, page_num)
+                req = self.prepare_batch_request(image, safe_pdf_id, page_num)
                 batch_requests.append(req)
             
-            jsonl_path = self.config.batch_requests_dir / f"{pdf_path.stem}_batch_{batch_idx:03d}.jsonl"
+            jsonl_path = self.config.batch_requests_dir / f"{safe_pdf_id}_batch_{batch_idx:03d}.jsonl"
             self.create_jsonl_file(batch_requests, jsonl_path)
             
             uploaded_file = self.upload_jsonl_file(jsonl_path)
             
-            display_name = f"{pdf_path.stem}_batch_{batch_idx:03d}"
+            display_name = f"{safe_pdf_id}_batch_{batch_idx:03d}"
             job_name = self.submit_batch_job(uploaded_file, display_name)
             
             job_manager.add_job(pdf_name, batch_idx, job_name, page_start, page_end, uploaded_file)
@@ -682,6 +692,7 @@ class GeminiOCRProcessor:
     def collect_batch_results(self, pdf_path: Path, job_manager: BatchJobManager, 
                               total_pages: int) -> str:
         pdf_name = pdf_path.name
+        safe_pdf_id = self._safe_ascii_name(pdf_path.stem)
         all_results: Dict[int, str] = {}
         
         for job in job_manager.get_all_jobs_for_pdf(pdf_name):
@@ -690,7 +701,7 @@ class GeminiOCRProcessor:
                     all_results[page] = f"<!-- Page {page}: Batch Job Failed -->"
                 continue
             
-            result_path = self.config.batch_results_dir / f"{pdf_path.stem}_batch_{job['batch_index']:03d}_result.jsonl"
+            result_path = self.config.batch_results_dir / f"{safe_pdf_id}_batch_{job['batch_index']:03d}_result.jsonl"
             
             if result_path.exists():
                 with open(result_path, 'r', encoding='utf-8') as f:
