@@ -559,15 +559,24 @@ class GeminiOCRProcessor:
         return batch_job.name
     
     def poll_job_status(self, job_name: str) -> Dict:
-        batch_job = self.client.batches.get(name=job_name)
-        state_name = ''
-        if batch_job.state:
-            state_name = batch_job.state.name if hasattr(batch_job.state, 'name') else str(batch_job.state)
-        return {
-            'name': batch_job.name,
-            'state': state_name,
-            'dest': batch_job.dest
-        }
+        for attempt in range(self.config.max_retries):
+            try:
+                batch_job = self.client.batches.get(name=job_name)
+                state_name = ''
+                if batch_job.state:
+                    state_name = batch_job.state.name if hasattr(batch_job.state, 'name') else str(batch_job.state)
+                return {
+                    'name': batch_job.name,
+                    'state': state_name,
+                    'dest': batch_job.dest
+                }
+            except Exception as e:
+                self.logger.warning(f"轮询 {job_name} 失败 (尝试 {attempt+1}/{self.config.max_retries}): {e}")
+                if attempt < self.config.max_retries - 1:
+                    time.sleep(self.config.retry_delay)
+                else:
+                    raise
+        return {'name': job_name, 'state': 'POLL_ERROR', 'dest': None}
     
     def poll_jobs_until_complete(self, job_names: List[str]) -> Dict[str, Dict]:
         results = {}
