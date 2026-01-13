@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-这是一个基于 Google Gemini 2.5 Pro 模型的批量 PDF OCR 工具，专门设计用于处理扫描版 PDF 文档并将其转换为高质量的 Markdown 格式。
+这是一个基于 Google Gemini 3 Flash Preview 模型的批量 PDF OCR 工具，专门设计用于处理扫描版 PDF 文档并将其转换为高质量的 Markdown 格式。查看[基准测试结果](https://github.com/mustakshif/arabic-ocr-benchmark-tool?tab=readme-ov-file#benchmark-results)了解模型对比。
 
 ## 项目简介
 
@@ -10,7 +10,7 @@
 
 **核心优势：**
 - **Batch API 支持**：支持 Google Gemini Batch API，相比实时 API 可**节省 50% 的成本**，非常适合大规模文档处理。
-- **高精度 OCR**：利用 Gemini 2.5 Pro 的原生多模态能力，能够处理表格、标题、列表等复杂布局。
+- **高精度 OCR**：利用 Gemini 3 Flash Preview 的原生多模态能力，能够处理表格、标题、列表等复杂布局。
 - **稳健性**：内置断点续传、失败重试和并发控制机制。
 
 ---
@@ -57,7 +57,7 @@
 
 2. 编辑 `.env` 文件，填入必要信息：
    - `GEMINI_API_KEY`: 你的 Google AI Studio API 密钥。
-   - `MODEL_NAME`: 使用的模型，默认为 `gemini-2.5-pro`。
+   - `MODEL_NAME`: 使用的模型，默认为 `gemini-3-flash-preview`。
    - `PRIMARY_LANGUAGE`: 主要识别语言（如 Arabic, Chinese, English）。
    - `BATCH_SIZE`: Batch 模式下每批处理的页数（建议 50）。
 

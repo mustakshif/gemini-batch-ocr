@@ -18,9 +18,10 @@ venv/
 .LSOverride
 
 # Working directories
-input/
-output/
+input/*
+output/*
 logs/
+!.gitkeep
 
 # IDE
 .idea/
