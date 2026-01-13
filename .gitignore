@@ -1,0 +1,29 @@
+# Environment and secrets
+.env
+*.env
+!config.example.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Working directories
+input/
+output/
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
