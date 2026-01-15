@@ -645,28 +645,48 @@ class GeminiOCRProcessor:
             return '\n'.join(results)
         return ''
     
-    def parse_batch_results(self, jsonl_content: str) -> Dict[str, str]:
+    def parse_batch_results(self, jsonl_content: str) -> Tuple[Dict[str, str], Dict[str, int]]:
+        """Parse batch results and extract token usage.
+        
+        Returns:
+            Tuple of (results dict, usage stats dict)
+            - results: {key: text_content}
+            - usage: {prompt_tokens, candidates_tokens, total_tokens, request_count}
+        """
         results = {}
+        usage = {'prompt_tokens': 0, 'candidates_tokens': 0, 'total_tokens': 0, 'request_count': 0}
+        
         for line in jsonl_content.strip().split('\n'):
             if not line:
                 continue
             try:
                 data = json.loads(line)
                 key = data.get('key', '')
+                
                 if 'response' in data and data['response']:
-                    candidates = data['response'].get('candidates', [])
+                    response = data['response']
+                    candidates = response.get('candidates', [])
                     if candidates:
                         parts = candidates[0].get('content', {}).get('parts', [])
                         if parts:
                             text = parts[0].get('text', '')
                             results[key] = text
+                    
+                    usage_meta = response.get('usageMetadata', {})
+                    usage['prompt_tokens'] += usage_meta.get('promptTokenCount', 0)
+                    usage['candidates_tokens'] += usage_meta.get('candidatesTokenCount', 0)
+                    usage['total_tokens'] += usage_meta.get('totalTokenCount', 0)
+                    usage['request_count'] += 1
+                    
                 elif 'error' in data:
                     results[key] = f"<!-- OCR Error: {data['error']} -->"
+                    
             except json.JSONDecodeError as e:
                 self.logger.warning(f"解析结果行失败: {e}")
-        return results
+        
+        return results, usage
     
-    def process_pdf_batch(self, pdf_path: Path, job_manager: BatchJobManager) -> Optional[str]:
+    def process_pdf_batch(self, pdf_path: Path, job_manager: BatchJobManager) -> Optional[Tuple[str, Dict[str, int]]]:
         pdf_name = pdf_path.name
         safe_pdf_id = self._safe_ascii_name(pdf_path.stem)
         self.logger.info(f"[Batch模式] 开始处理: {pdf_name}")
@@ -729,10 +749,12 @@ class GeminiOCRProcessor:
         return self.collect_batch_results(pdf_path, job_manager, total_pages)
     
     def collect_batch_results(self, pdf_path: Path, job_manager: BatchJobManager, 
-                              total_pages: int) -> str:
+                              total_pages: int) -> Tuple[str, Dict[str, int]]:
+        """Collect and merge batch results with token usage statistics."""
         pdf_name = pdf_path.name
         safe_pdf_id = self._safe_ascii_name(pdf_path.stem)
         all_results: Dict[int, str] = {}
+        total_usage = {'prompt_tokens': 0, 'candidates_tokens': 0, 'total_tokens': 0, 'request_count': 0}
         
         for job in job_manager.get_all_jobs_for_pdf(pdf_name):
             if job['status'] != 'JOB_STATE_SUCCEEDED':
@@ -751,7 +773,10 @@ class GeminiOCRProcessor:
                 with open(result_path, 'w', encoding='utf-8') as f:
                     f.write(jsonl_content)
             
-            parsed = self.parse_batch_results(jsonl_content)
+            parsed, usage = self.parse_batch_results(jsonl_content)
+            
+            for key, value in usage.items():
+                total_usage[key] += value
             
             for key, content in parsed.items():
                 try:
@@ -765,7 +790,7 @@ class GeminiOCRProcessor:
             content = all_results.get(page_num, f"<!-- Page {page_num}: No result -->")
             full_content.append(f"<!-- Page {page_num} -->\n\n{content}")
         
-        return "\n\n---\n\n".join(full_content)
+        return "\n\n---\n\n".join(full_content), total_usage
 
 
 # ============================================================================
@@ -792,6 +817,39 @@ def print_job_status(job_manager: BatchJobManager, logger: logging.Logger):
         logger.info(f"\n{pdf_file}:")
         for job in jobs:
             logger.info(f"  批次 {job['batch_index']}: {job['status']} (页 {job['page_start']}-{job['page_end']})")
+
+
+BATCH_PRICING = {
+    "gemini-3-pro-preview": {"input": 1.00, "output": 3.00},
+    "gemini-3-flash-preview": {"input": 0.25, "output": 0.75},
+    "gemini-2.5-pro": {"input": 0.625, "output": 2.50},
+    "gemini-2.5-flash": {"input": 0.15, "output": 0.50},
+}
+
+
+def _log_usage_stats(logger: logging.Logger, usage: Dict[str, int], model_name: str):
+    prompt_tokens = usage.get('prompt_tokens', 0)
+    output_tokens = usage.get('candidates_tokens', 0)
+    total_tokens = usage.get('total_tokens', 0)
+    request_count = usage.get('request_count', 0)
+    
+    logger.info("=" * 60)
+    logger.info("Token 使用统计")
+    logger.info(f"  请求数: {request_count}")
+    logger.info(f"  Input tokens: {prompt_tokens:,}")
+    logger.info(f"  Output tokens: {output_tokens:,}")
+    logger.info(f"  Total tokens: {total_tokens:,}")
+    
+    pricing = BATCH_PRICING.get(model_name)
+    if pricing:
+        input_cost = (prompt_tokens / 1_000_000) * pricing["input"]
+        output_cost = (output_tokens / 1_000_000) * pricing["output"]
+        total_cost = input_cost + output_cost
+        logger.info(f"  估算成本 (Batch API 半价):")
+        logger.info(f"    Input:  ${input_cost:.4f}")
+        logger.info(f"    Output: ${output_cost:.4f}")
+        logger.info(f"    Total:  ${total_cost:.4f}")
+    logger.info("=" * 60)
 
 
 def main():
@@ -883,7 +941,7 @@ def main():
                     continue
                 
                 total_pages = sum(j['page_end'] - j['page_start'] + 1 for j in jobs)
-                markdown_content = processor.collect_batch_results(pdf_path, job_manager, total_pages)
+                markdown_content, usage = processor.collect_batch_results(pdf_path, job_manager, total_pages)
                 
                 output_path = config.output_dir / f"{pdf_path.stem}.md"
                 with open(output_path, 'w', encoding='utf-8') as f:
@@ -894,20 +952,23 @@ def main():
                     f.write(markdown_content)
                 
                 logger.info(f"已保存: {output_path}")
+                _log_usage_stats(logger, usage, config.model_name)
         else:
             for pdf_path in pdf_files:
                 try:
                     result = processor.process_pdf_batch(pdf_path, job_manager)
                     
                     if result:
+                        markdown_content, usage = result
                         output_path = config.output_dir / f"{pdf_path.stem}.md"
                         with open(output_path, 'w', encoding='utf-8') as f:
                             f.write(f"# {pdf_path.stem}\n\n")
                             f.write(f"*OCR processed on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n")
                             f.write(f"*Model: {config.model_name} (Batch API)*\n\n")
                             f.write("---\n\n")
-                            f.write(result)
+                            f.write(markdown_content)
                         logger.info(f"已保存: {output_path}")
+                        _log_usage_stats(logger, usage, config.model_name)
                     
                 except Exception as e:
                     logger.error(f"处理 {pdf_path.name} 时出错: {e}")
