@@ -358,6 +358,36 @@ class BatchJobManager:
                 if job['job_name']:
                     names.append(job['job_name'])
         return names
+    
+    def sync_from_remote(self, client) -> Dict[str, int]:
+        """从远程 API 同步所有 job 状态，返回更新统计"""
+        updated = {'synced': 0, 'errors': 0}
+        
+        for pdf_file, job_list in self.jobs.items():
+            for job in job_list:
+                if job['status'] in self.COMPLETED_STATES:
+                    continue  # 已完成的不需要再查
+                
+                try:
+                    batch_job = client.batches.get(name=job['job_name'])
+                    state = batch_job.state.name if hasattr(batch_job.state, 'name') else str(batch_job.state)
+                    
+                    if job['status'] != state:
+                        job['status'] = state
+                        if state in self.COMPLETED_STATES:
+                            job['completed_at'] = datetime.now().isoformat()
+                        if batch_job.dest and batch_job.dest.file_name:
+                            job['result_file'] = batch_job.dest.file_name
+                        updated['synced'] += 1
+                        
+                except Exception as e:
+                    updated['errors'] += 1
+                    logging.warning(f"同步 {job['job_name']} 失败: {e}")
+        
+        if updated['synced'] > 0:
+            self._save()
+        
+        return updated
 
 
 # ============================================================================
@@ -792,6 +822,11 @@ def main():
     
     if args.status:
         job_manager = BatchJobManager(config.batch_status_file)
+        client = genai.Client(api_key=config.gemini_api_key)
+        logger.info("同步远程状态...")
+        sync_result = job_manager.sync_from_remote(client)
+        if sync_result['synced'] > 0:
+            logger.info(f"已同步 {sync_result['synced']} 个 job 状态")
         print_job_status(job_manager, logger)
         sys.exit(0)
     
@@ -836,6 +871,11 @@ def main():
         
         if args.download:
             logger.info("下载模式: 获取已完成的结果")
+            logger.info("同步远程状态...")
+            sync_result = job_manager.sync_from_remote(processor.client)
+            if sync_result['synced'] > 0:
+                logger.info(f"已同步 {sync_result['synced']} 个 job 状态")
+            
             for pdf_path in pdf_files:
                 jobs = job_manager.get_all_jobs_for_pdf(pdf_path.name)
                 if not jobs:
