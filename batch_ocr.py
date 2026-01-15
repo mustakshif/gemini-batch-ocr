@@ -651,10 +651,10 @@ class GeminiOCRProcessor:
         Returns:
             Tuple of (results dict, usage stats dict)
             - results: {key: text_content}
-            - usage: {prompt_tokens, candidates_tokens, total_tokens, request_count}
+            - usage: {prompt_tokens, candidates_tokens, thinking_tokens, total_tokens, request_count}
         """
         results = {}
-        usage = {'prompt_tokens': 0, 'candidates_tokens': 0, 'total_tokens': 0, 'request_count': 0}
+        usage = {'prompt_tokens': 0, 'candidates_tokens': 0, 'thinking_tokens': 0, 'total_tokens': 0, 'request_count': 0}
         
         for line in jsonl_content.strip().split('\n'):
             if not line:
@@ -675,6 +675,7 @@ class GeminiOCRProcessor:
                     usage_meta = response.get('usageMetadata', {})
                     usage['prompt_tokens'] += usage_meta.get('promptTokenCount', 0)
                     usage['candidates_tokens'] += usage_meta.get('candidatesTokenCount', 0)
+                    usage['thinking_tokens'] += usage_meta.get('thoughtsTokenCount', 0)
                     usage['total_tokens'] += usage_meta.get('totalTokenCount', 0)
                     usage['request_count'] += 1
                     
@@ -754,7 +755,7 @@ class GeminiOCRProcessor:
         pdf_name = pdf_path.name
         safe_pdf_id = self._safe_ascii_name(pdf_path.stem)
         all_results: Dict[int, str] = {}
-        total_usage = {'prompt_tokens': 0, 'candidates_tokens': 0, 'total_tokens': 0, 'request_count': 0}
+        total_usage = {'prompt_tokens': 0, 'candidates_tokens': 0, 'thinking_tokens': 0, 'total_tokens': 0, 'request_count': 0}
         
         for job in job_manager.get_all_jobs_for_pdf(pdf_name):
             if job['status'] != 'JOB_STATE_SUCCEEDED':
@@ -820,9 +821,9 @@ def print_job_status(job_manager: BatchJobManager, logger: logging.Logger):
 
 
 BATCH_PRICING = {
-    "gemini-3-pro-preview": {"input": 1.00, "output": 3.00},
-    "gemini-3-flash-preview": {"input": 0.25, "output": 0.75},
-    "gemini-2.5-pro": {"input": 0.625, "output": 2.50},
+    "gemini-3-pro-preview": {"input": 1.00, "output": 3.00, "thinking": 0.50},
+    "gemini-3-flash-preview": {"input": 0.25, "output": 0.75, "thinking": 0.15},
+    "gemini-2.5-pro": {"input": 0.625, "output": 2.50, "thinking": 0.50},
     "gemini-2.5-flash": {"input": 0.15, "output": 0.50},
 }
 
@@ -830,25 +831,34 @@ BATCH_PRICING = {
 def _log_usage_stats(logger: logging.Logger, usage: Dict[str, int], model_name: str):
     prompt_tokens = usage.get('prompt_tokens', 0)
     output_tokens = usage.get('candidates_tokens', 0)
+    thinking_tokens = usage.get('thinking_tokens', 0)
     total_tokens = usage.get('total_tokens', 0)
     request_count = usage.get('request_count', 0)
     
     logger.info("=" * 60)
     logger.info("Token 使用统计")
     logger.info(f"  请求数: {request_count}")
-    logger.info(f"  Input tokens: {prompt_tokens:,}")
-    logger.info(f"  Output tokens: {output_tokens:,}")
-    logger.info(f"  Total tokens: {total_tokens:,}")
+    logger.info(f"  Input tokens:    {prompt_tokens:,}")
+    logger.info(f"  Output tokens:   {output_tokens:,}")
+    if thinking_tokens > 0:
+        logger.info(f"  Thinking tokens: {thinking_tokens:,}")
+    logger.info(f"  Total tokens:    {total_tokens:,}")
     
     pricing = BATCH_PRICING.get(model_name)
     if pricing:
         input_cost = (prompt_tokens / 1_000_000) * pricing["input"]
         output_cost = (output_tokens / 1_000_000) * pricing["output"]
-        total_cost = input_cost + output_cost
+        thinking_cost = 0
+        if thinking_tokens > 0 and "thinking" in pricing:
+            thinking_cost = (thinking_tokens / 1_000_000) * pricing["thinking"]
+        total_cost = input_cost + output_cost + thinking_cost
+        
         logger.info(f"  估算成本 (Batch API 半价):")
-        logger.info(f"    Input:  ${input_cost:.4f}")
-        logger.info(f"    Output: ${output_cost:.4f}")
-        logger.info(f"    Total:  ${total_cost:.4f}")
+        logger.info(f"    Input:    ${input_cost:.4f}")
+        logger.info(f"    Output:   ${output_cost:.4f}")
+        if thinking_cost > 0:
+            logger.info(f"    Thinking: ${thinking_cost:.4f}")
+        logger.info(f"    Total:    ${total_cost:.4f}")
     logger.info("=" * 60)
 
 
