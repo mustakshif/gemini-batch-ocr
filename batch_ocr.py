@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Gemini 2.5 Pro Batch OCR Script
-================================
-批量处理扫描版PDF，使用Gemini 2.5 Pro进行OCR，输出Markdown格式。
+Gemini Batch OCR Script
+=======================
+批量处理扫描版 PDF，默认使用 Gemini 3.1 Flash-Lite Preview 进行 OCR，输出 Markdown 格式。
 
 功能特性：
 - 支持阿拉伯语等复杂语种（RTL脚本）
@@ -58,7 +58,7 @@ class Config:
         
         # API配置
         self.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
-        self.model_name = os.getenv("MODEL_NAME", "gemini-2.5-pro")
+        self.model_name = os.getenv("MODEL_NAME", "gemini-3.1-flash-lite-preview")
         
         # 路径配置
         self.base_dir = Path(__file__).parent
@@ -821,11 +821,48 @@ def print_job_status(job_manager: BatchJobManager, logger: logging.Logger):
 
 
 BATCH_PRICING = {
-    "gemini-3-pro-preview": {"input": 1.00, "output": 3.00, "thinking": 0.50},
-    "gemini-3-flash-preview": {"input": 0.25, "output": 0.75, "thinking": 0.15},
-    "gemini-2.5-pro": {"input": 0.625, "output": 2.50, "thinking": 0.50},
-    "gemini-2.5-flash": {"input": 0.15, "output": 0.50},
+    "gemini-3.1-pro-preview": {
+        "tiers": [
+            {"max_prompt_tokens": 200_000, "input": 1.00, "output": 6.00},
+            {"input": 2.00, "output": 9.00},
+        ]
+    },
+    "gemini-3.1-flash-lite-preview": {"input": 0.125, "output": 0.75},
+    "gemini-3-flash-preview": {"input": 0.25, "output": 1.50},
+    "gemini-2.5-pro": {
+        "tiers": [
+            {"max_prompt_tokens": 200_000, "input": 0.625, "output": 5.00},
+            {"input": 1.25, "output": 7.50},
+        ]
+    },
+    "gemini-2.5-flash": {"input": 0.15, "output": 1.25},
+    "gemini-2.5-flash-lite": {"input": 0.05, "output": 0.20},
 }
+
+
+def _resolve_batch_pricing(model_name: str, prompt_tokens: int) -> Tuple[Optional[Dict[str, float]], Optional[str]]:
+    pricing = BATCH_PRICING.get(model_name)
+    if not pricing:
+        return None, None
+
+    tiers = pricing.get("tiers")
+    if not tiers:
+        return pricing, None
+
+    for tier in tiers:
+        max_prompt_tokens = tier.get("max_prompt_tokens")
+        if max_prompt_tokens is None or prompt_tokens <= max_prompt_tokens:
+            tier_label = None
+            if max_prompt_tokens is not None:
+                tier_label = f"prompt <= {max_prompt_tokens:,}"
+            else:
+                tier_label = "prompt > 200,000"
+            return {
+                "input": float(tier["input"]),
+                "output": float(tier["output"]),
+            }, tier_label
+
+    return None, None
 
 
 def _log_usage_stats(logger: logging.Logger, usage: Dict[str, int], model_name: str):
@@ -834,6 +871,7 @@ def _log_usage_stats(logger: logging.Logger, usage: Dict[str, int], model_name: 
     thinking_tokens = usage.get('thinking_tokens', 0)
     total_tokens = usage.get('total_tokens', 0)
     request_count = usage.get('request_count', 0)
+    billed_output_tokens = output_tokens + thinking_tokens
     
     logger.info("=" * 60)
     logger.info("Token 使用统计")
@@ -844,20 +882,19 @@ def _log_usage_stats(logger: logging.Logger, usage: Dict[str, int], model_name: 
         logger.info(f"  Thinking tokens: {thinking_tokens:,}")
     logger.info(f"  Total tokens:    {total_tokens:,}")
     
-    pricing = BATCH_PRICING.get(model_name)
+    pricing, tier_label = _resolve_batch_pricing(model_name, prompt_tokens)
     if pricing:
         input_cost = (prompt_tokens / 1_000_000) * pricing["input"]
-        output_cost = (output_tokens / 1_000_000) * pricing["output"]
-        thinking_cost = 0
-        if thinking_tokens > 0 and "thinking" in pricing:
-            thinking_cost = (thinking_tokens / 1_000_000) * pricing["thinking"]
-        total_cost = input_cost + output_cost + thinking_cost
+        output_cost = (billed_output_tokens / 1_000_000) * pricing["output"]
+        total_cost = input_cost + output_cost
         
         logger.info(f"  估算成本 (Batch API 半价):")
+        if tier_label:
+            logger.info(f"    Pricing tier: {tier_label}")
         logger.info(f"    Input:    ${input_cost:.4f}")
         logger.info(f"    Output:   ${output_cost:.4f}")
-        if thinking_cost > 0:
-            logger.info(f"    Thinking: ${thinking_cost:.4f}")
+        if thinking_tokens > 0:
+            logger.info(f"    Billed output tokens (含 thinking): {billed_output_tokens:,}")
         logger.info(f"    Total:    ${total_cost:.4f}")
     logger.info("=" * 60)
 

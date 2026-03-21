@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-这是一个基于 Google Gemini 3 Flash Preview 模型的批量 PDF OCR 工具，专门设计用于处理扫描版 PDF 文档并将其转换为高质量的 Markdown 格式。查看[基准测试结果](https://github.com/mustakshif/arabic-ocr-benchmark-tool?tab=readme-ov-file#benchmark-results)了解模型对比。
+这是一个批量 PDF OCR 工具，默认使用 Google `gemini-3.1-flash-lite-preview`，专门设计用于以更低的 Batch API 成本处理扫描版 PDF，并将其转换为高质量的 Markdown 格式。查看[基准测试结果](https://github.com/mustakshif/arabic-ocr-benchmark-tool?tab=readme-ov-file#benchmark-results)了解模型对比。
 
 ## 项目简介
 
@@ -10,7 +10,7 @@
 
 **核心优势：**
 - **Batch API 支持**：支持 Google Gemini Batch API，相比实时 API 可**节省 50% 的成本**，非常适合大规模文档处理。
-- **高精度 OCR**：利用 Gemini 3 Flash Preview 的原生多模态能力，能够处理表格、标题、列表等复杂布局。
+- **高性价比 OCR**：默认使用 Gemini 3.1 Flash-Lite Preview，适合大批量 OCR；如果你更看重质量，也可以切换到更高阶的 Gemini 模型。
 - **稳健性**：内置断点续传、失败重试和并发控制机制。
 
 ---
@@ -57,9 +57,27 @@
 
 2. 编辑 `.env` 文件，填入必要信息：
    - `GEMINI_API_KEY`: 你的 Google AI Studio API 密钥。
-   - `MODEL_NAME`: 使用的模型，默认为 `gemini-3-flash-preview`。
+   - `MODEL_NAME`: 使用的模型，默认为 `gemini-3.1-flash-lite-preview`。
    - `PRIMARY_LANGUAGE`: 主要识别语言（如 Arabic, Chinese, English）。
    - `BATCH_SIZE`: Batch 模式下每批处理的页数（建议 50）。
+
+### 默认模型与 Batch 定价
+
+下面价格已在 **2026-03-21** 按 Gemini Developer API 官方页面核对：
+<https://ai.google.dev/gemini-api/docs/pricing>
+
+| 模型 | Batch 输入 / 100万 tokens | Batch 输出 / 100万 tokens | 说明 |
+| --- | ---: | ---: | --- |
+| `gemini-3.1-flash-lite-preview` | $0.125 | $0.75 | 默认模型，当前成本最低 |
+| `gemini-3-flash-preview` | $0.25 | $1.50 | 更强一些，但更贵 |
+| `gemini-2.5-flash` | $0.15 | $1.25 | 稳定版，速度和成本较平衡 |
+| `gemini-2.5-flash-lite` | $0.05 | $0.20 | 最便宜的稳定版 |
+| `gemini-2.5-pro` | $0.625 / $1.25 | $5.00 / $7.50 | 输入超过 200k tokens 时使用高档位 |
+| `gemini-3.1-pro-preview` | $1.00 / $2.00 | $6.00 / $9.00 | 输入超过 200k tokens 时使用高档位 |
+
+说明：
+- Google 当前把 thinking tokens 计入输出价格，这个项目的成本估算也已按这个口径更新。
+- Batch API 的价格通常约为标准 API 的 50%。
 
 ---
 
@@ -139,6 +157,9 @@ python batch_ocr.py --realtime
 
 **Q: 为什么推荐使用 Batch API？**
 A: 除了 50% 的价格优惠外，Batch API 拥有更高的配额限制，能够同时处理数千页文档而不会触发现流限制。
+
+**Q: 这个脚本现在怎么估算成本？**
+A: 脚本会按上面的 Batch 价格表估算，并把 thinking tokens 一起计入 output 成本，和当前 Gemini 官方定价口径保持一致。
 
 **Q: 处理后的文件保存在哪里？**
 A: 最终的 Markdown 文件保存在 `output/` 目录。日志和中间状态保存在 `logs/` 目录。

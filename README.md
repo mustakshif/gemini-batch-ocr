@@ -2,7 +2,7 @@
 
 [中文文档](README.zh-CN.md)
 
-A batch PDF OCR tool powered by Google Gemini 3 Flash Preview, designed for converting scanned PDF documents into high-quality Markdown format. See [benchmark results](https://github.com/mustakshif/arabic-ocr-benchmark-tool?tab=readme-ov-file#benchmark-results) for model comparison.
+A batch PDF OCR tool that now defaults to Google `gemini-3.1-flash-lite-preview`, designed for converting scanned PDF documents into high-quality Markdown format at lower Batch API cost. See [benchmark results](https://github.com/mustakshif/arabic-ocr-benchmark-tool?tab=readme-ov-file#benchmark-results) for model comparison.
 
 ## Overview
 
@@ -10,7 +10,7 @@ This tool leverages Gemini's powerful vision capabilities to accurately recogniz
 
 **Key Advantages:**
 - **Batch API Support**: Uses Google Gemini Batch API for **50% cost savings** compared to real-time API, ideal for large-scale document processing.
-- **High-Precision OCR**: Utilizes Gemini 3 Flash Preview's native multimodal capabilities to handle tables, headings, lists, and complex layouts.
+- **Cost-Efficient OCR**: Defaults to Gemini 3.1 Flash-Lite Preview for high-volume OCR, while still allowing you to switch to higher-end Gemini models when needed.
 - **Robustness**: Built-in checkpoint recovery, retry mechanism, and concurrency control.
 
 ---
@@ -57,9 +57,27 @@ This tool leverages Gemini's powerful vision capabilities to accurately recogniz
 
 2. Edit `.env` file with your settings:
    - `GEMINI_API_KEY`: Your Google AI Studio API key.
-   - `MODEL_NAME`: Model to use, defaults to `gemini-3-flash-preview`.
+   - `MODEL_NAME`: Model to use, defaults to `gemini-3.1-flash-lite-preview`.
    - `PRIMARY_LANGUAGE`: Primary recognition language (e.g., Arabic, Chinese, English).
    - `BATCH_SIZE`: Pages per batch in Batch mode (recommended: 50).
+
+### Default Model And Batch Pricing
+
+Prices below were verified against the official Gemini Developer API pricing page on **2026-03-21**:
+<https://ai.google.dev/gemini-api/docs/pricing>
+
+| Model | Batch input / 1M tokens | Batch output / 1M tokens | Notes |
+| --- | ---: | ---: | --- |
+| `gemini-3.1-flash-lite-preview` | $0.125 | $0.75 | Default model, lowest cost |
+| `gemini-3-flash-preview` | $0.25 | $1.50 | Higher cost, stronger preview model |
+| `gemini-2.5-flash` | $0.15 | $1.25 | Stable general-purpose option |
+| `gemini-2.5-flash-lite` | $0.05 | $0.20 | Cheapest stable option |
+| `gemini-2.5-pro` | $0.625 / $1.25 | $5.00 / $7.50 | Higher tier applies when prompt input exceeds 200k tokens |
+| `gemini-3.1-pro-preview` | $1.00 / $2.00 | $6.00 / $9.00 | Higher tier applies when prompt input exceeds 200k tokens |
+
+Notes:
+- Google bills output pricing inclusive of thinking tokens for these Gemini models.
+- Batch API pricing is generally 50% lower than the corresponding standard API pricing.
 
 ---
 
@@ -143,6 +161,9 @@ For large-scale tasks, execute in separate steps:
 
 **Q: Why use Batch API?**
 A: Besides 50% price discount, Batch API has higher quota limits, enabling processing of thousands of pages simultaneously without hitting rate limits.
+
+**Q: How does this script estimate token cost?**
+A: The script uses the Batch API price table above and counts thinking tokens as part of output cost, matching the current Gemini pricing model.
 
 **Q: Where are processed files saved?**
 A: Final Markdown files are saved in `output/`. Logs and intermediate states are in `logs/`.
