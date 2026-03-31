@@ -77,6 +77,7 @@ class Config:
         self.use_batch_api = True  # 默认使用 Batch API
         self.batch_size = int(os.getenv("BATCH_SIZE", "50"))  # 每批最大页数
         self.poll_interval = int(os.getenv("POLL_INTERVAL", "30"))  # 轮询间隔(秒)
+        self.max_active_batch_jobs = int(os.getenv("MAX_ACTIVE_BATCH_JOBS", "20"))  # 同时挂起/运行的最大 Batch Job 数
         self.wait_for_completion = True  # 是否等待完成
         
         # Batch API 目录
@@ -229,6 +230,7 @@ class BatchJobManager:
     """Batch Job 状态管理器"""
     
     COMPLETED_STATES = {'JOB_STATE_SUCCEEDED', 'JOB_STATE_FAILED', 'JOB_STATE_CANCELLED', 'JOB_STATE_EXPIRED'}
+    ACTIVE_STATES = {'pending', 'JOB_STATE_PENDING', 'JOB_STATE_RUNNING'}
     
     def __init__(self, status_file: Path):
         self.status_file = status_file
@@ -312,9 +314,24 @@ class BatchJobManager:
         target_jobs = self.jobs.get(pdf_file, []) if pdf_file else \
                       [job for jobs in self.jobs.values() for job in jobs]
         for job in target_jobs:
-            if job['status'] in ('pending', 'JOB_STATE_PENDING', 'JOB_STATE_RUNNING'):
+            if job['status'] in self.ACTIVE_STATES:
                 pending.append(job)
         return pending
+
+    def get_active_jobs(self) -> List[Dict]:
+        return [
+            job
+            for jobs in self.jobs.values()
+            for job in jobs
+            if job['status'] in self.ACTIVE_STATES
+        ]
+
+    def get_all_jobs(self) -> List[Tuple[str, Dict]]:
+        flattened: List[Tuple[str, Dict]] = []
+        for pdf_file, jobs in self.jobs.items():
+            for job in jobs:
+                flattened.append((pdf_file, job))
+        return flattened
     
     def get_succeeded_jobs(self, pdf_file: Optional[str] = None) -> List[Dict]:
         succeeded = []
@@ -402,6 +419,7 @@ class GeminiOCRProcessor:
         self.logger = logging.getLogger(__name__)
         
         self.client = genai.Client(api_key=config.gemini_api_key)
+        self.queue_limit_reached = False
         
     def pdf_to_images(self, pdf_path: Path) -> List[Image.Image]:
         """将PDF转换为图片列表"""
@@ -587,6 +605,33 @@ class GeminiOCRProcessor:
             raise RuntimeError("Batch job creation failed: no name returned")
         self.logger.info(f"Job 已创建: {batch_job.name}")
         return batch_job.name
+
+    def wait_for_submission_slot(self, job_manager: BatchJobManager, allow_wait: bool) -> bool:
+        """在提交新 job 前控制活跃队列大小。"""
+        while True:
+            sync_result = job_manager.sync_from_remote(self.client)
+            if sync_result['errors'] > 0:
+                self.logger.warning(f"同步远程状态时出现 {sync_result['errors']} 个错误")
+            active_count = len(job_manager.get_active_jobs())
+            limit = self.config.max_active_batch_jobs
+
+            if active_count < limit:
+                return True
+
+            if not allow_wait:
+                self.logger.info(
+                    f"当前活跃 Batch Job 数 {active_count} 已达到上限 {limit}，停止继续提交。"
+                )
+                if not self.config.wait_for_completion:
+                    self.logger.info("稍后重新执行 --no-wait，可继续补位提交剩余文件。")
+                self.queue_limit_reached = True
+                return False
+
+            self.logger.info(
+                f"当前活跃 Batch Job 数 {active_count} 已达到上限 {limit}，"
+                f"等待 {self.config.poll_interval} 秒后重试提交。"
+            )
+            time.sleep(self.config.poll_interval)
     
     def poll_job_status(self, job_name: str) -> Dict:
         for attempt in range(self.config.max_retries):
@@ -687,9 +732,16 @@ class GeminiOCRProcessor:
         
         return results, usage
     
-    def process_pdf_batch(self, pdf_path: Path, job_manager: BatchJobManager) -> Optional[Tuple[str, Dict[str, int]]]:
+    def submit_pdf_batch_jobs(
+        self,
+        pdf_path: Path,
+        job_manager: BatchJobManager,
+        *,
+        allow_wait_for_slot: bool,
+    ) -> Tuple[int, bool]:
         pdf_name = pdf_path.name
         safe_pdf_id = self._safe_ascii_name(pdf_path.stem)
+        self.queue_limit_reached = False
         self.logger.info(f"[Batch模式] 开始处理: {pdf_name}")
         
         images = self.pdf_to_images(pdf_path)
@@ -697,15 +749,42 @@ class GeminiOCRProcessor:
         
         batch_size = self.config.batch_size
         num_batches = (total_pages + batch_size - 1) // batch_size
+        existing_jobs = job_manager.get_all_jobs_for_pdf(pdf_name)
+        existing_active = sum(1 for job in existing_jobs if job['status'] in BatchJobManager.ACTIVE_STATES)
+        existing_done = sum(1 for job in existing_jobs if job['status'] == 'JOB_STATE_SUCCEEDED')
         
         self.logger.info(f"共 {total_pages} 页，分 {num_batches} 批处理 (每批 {batch_size} 页)")
+        if existing_jobs:
+            self.logger.info(
+                f"已有 Batch 记录: 已完成 {existing_done} 批，活跃 {existing_active} 批，"
+                f"待补提交 {max(0, num_batches - len(existing_jobs))} 批"
+            )
         
-        submitted_jobs = []
+        submitted_jobs = 0
+        fully_submitted = True
         
         for batch_idx in range(num_batches):
-            if job_manager.is_batch_completed(pdf_name, batch_idx):
-                self.logger.info(f"批次 {batch_idx + 1}/{num_batches} 已完成，跳过")
-                continue
+            existing_job = job_manager._find_job(pdf_name, batch_idx)
+            if existing_job:
+                status = existing_job['status']
+                if status == 'JOB_STATE_SUCCEEDED':
+                    self.logger.info(f"批次 {batch_idx + 1}/{num_batches} 已完成，跳过")
+                    continue
+                if status in BatchJobManager.ACTIVE_STATES:
+                    self.logger.info(
+                        f"批次 {batch_idx + 1}/{num_batches} 已提交且仍在排队/运行 "
+                        f"({status})，跳过重复提交"
+                    )
+                    continue
+
+            if not self.wait_for_submission_slot(job_manager, allow_wait=allow_wait_for_slot):
+                fully_submitted = False
+                remaining_batches = num_batches - batch_idx
+                self.logger.info(
+                    f"{pdf_name}: 当前提交窗口已满，暂停补交；"
+                    f"剩余未提交批次 {remaining_batches} 个。"
+                )
+                break
             
             page_start = batch_idx * batch_size + 1
             page_end = min((batch_idx + 1) * batch_size, total_pages)
@@ -727,16 +806,35 @@ class GeminiOCRProcessor:
             job_name = self.submit_batch_job(uploaded_file, display_name)
             
             job_manager.add_job(pdf_name, batch_idx, job_name, page_start, page_end, uploaded_file)
-            submitted_jobs.append(job_name)
-        
+            submitted_jobs += 1
+
+        submitted_total = len(job_manager.get_all_jobs_for_pdf(pdf_name))
+        remaining_unsubmitted = max(0, num_batches - submitted_total)
+        self.logger.info(
+            f"{pdf_name}: 本轮新提交 {submitted_jobs} 批；"
+            f"累计已提交 {submitted_total}/{num_batches} 批；"
+            f"剩余未提交 {remaining_unsubmitted} 批。"
+        )
+
+        if fully_submitted:
+            self.logger.info(f"{pdf_name}: 所有批次均已提交，后续仅等待完成。")
+
+        return submitted_jobs, fully_submitted
+
+    def process_pdf_batch(self, pdf_path: Path, job_manager: BatchJobManager) -> Optional[Tuple[str, Dict[str, int]]]:
+        _, _ = self.submit_pdf_batch_jobs(
+            pdf_path,
+            job_manager,
+            allow_wait_for_slot=self.config.wait_for_completion,
+        )
+
         if not self.config.wait_for_completion:
             self.logger.info("提交完成，--no-wait 模式，退出等待")
             self.logger.info(f"稍后使用 --download 获取结果")
             return None
         
-        if not submitted_jobs:
-            submitted_jobs = [j['job_name'] for j in job_manager.get_pending_jobs(pdf_name)]
-        
+        submitted_jobs = [j['job_name'] for j in job_manager.get_pending_jobs(pdf_name)]
+
         if submitted_jobs:
             self.logger.info(f"等待 {len(submitted_jobs)} 个 Job 完成...")
             completed = self.poll_jobs_until_complete(submitted_jobs)
@@ -820,6 +918,72 @@ def print_job_status(job_manager: BatchJobManager, logger: logging.Logger):
             logger.info(f"  批次 {job['batch_index']}: {job['status']} (页 {job['page_start']}-{job['page_end']})")
 
 
+def cleanup_all_batch_jobs(job_manager: BatchJobManager, client, logger: logging.Logger) -> Dict[str, int]:
+    """取消并删除状态文件中记录的所有 Batch Job。"""
+    all_jobs = job_manager.get_all_jobs()
+    stats = {'total': len(all_jobs), 'cancelled': 0, 'deleted': 0, 'errors': 0}
+    lock = None
+
+    if not all_jobs:
+        logger.info("没有可清理的 Batch Job 记录")
+        return stats
+
+    logger.info(f"开始清理 {len(all_jobs)} 个 Batch Job")
+
+    for pdf_file, job in all_jobs:
+        status = job.get('status', '')
+        job_name = job.get('job_name')
+        if not job_name:
+            continue
+
+        if status in BatchJobManager.ACTIVE_STATES:
+            try:
+                client.batches.cancel(name=job_name)
+                stats['cancelled'] += 1
+                logger.info(f"已取消: {job_name} ({pdf_file})")
+            except Exception as e:
+                stats['errors'] += 1
+                logger.warning(f"取消失败 {job_name}: {e}")
+
+    if stats['cancelled'] > 0:
+        logger.info("等待 2 秒，让取消请求先到达服务端")
+        time.sleep(2)
+
+    from threading import Lock
+    lock = Lock()
+
+    def delete_one(pdf_file: str, job_name: str):
+        try:
+            client.batches.delete(name=job_name)
+            with lock:
+                stats['deleted'] += 1
+            logger.info(f"已删除: {job_name} ({pdf_file})")
+        except Exception as e:
+            with lock:
+                stats['errors'] += 1
+            logger.warning(f"删除失败 {job_name}: {e}")
+
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(all_jobs)))) as executor:
+        futures = []
+        for pdf_file, job in all_jobs:
+            job_name = job.get('job_name')
+            if not job_name:
+                continue
+            futures.append(executor.submit(delete_one, pdf_file, job_name))
+        for future in as_completed(futures):
+            future.result()
+
+    if stats['deleted'] == stats['total']:
+        job_manager.jobs = {}
+        job_manager._save()
+
+    logger.info(
+        f"清理完成: 总计 {stats['total']}，取消 {stats['cancelled']}，"
+        f"删除 {stats['deleted']}，错误 {stats['errors']}"
+    )
+    return stats
+
+
 BATCH_PRICING = {
     "gemini-3.1-pro-preview": {
         "tiers": [
@@ -874,6 +1038,78 @@ def _log_usage_stats(logger: logging.Logger, usage: Dict[str, int], model_name: 
     billed_output_tokens = output_tokens + thinking_tokens
     
     logger.info("=" * 60)
+
+
+def save_batch_markdown(
+    processor: GeminiOCRProcessor,
+    pdf_path: Path,
+    job_manager: BatchJobManager,
+    config: Config,
+    logger: logging.Logger,
+):
+    jobs = job_manager.get_all_jobs_for_pdf(pdf_path.name)
+    if not jobs:
+        logger.warning(f"{pdf_path.name}: 无 Batch Job 记录")
+        return
+
+    total_pages = sum(j['page_end'] - j['page_start'] + 1 for j in jobs)
+    markdown_content, usage = processor.collect_batch_results(pdf_path, job_manager, total_pages)
+
+    output_path = config.output_dir / f"{pdf_path.stem}.md"
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(f"# {pdf_path.stem}\n\n")
+        f.write(f"*OCR processed on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n")
+        f.write(f"*Model: {config.model_name} (Batch API)*\n\n")
+        f.write("---\n\n")
+        f.write(markdown_content)
+
+    logger.info(f"已保存: {output_path}")
+    _log_usage_stats(logger, usage, config.model_name)
+
+
+def run_batch_automation(
+    processor: GeminiOCRProcessor,
+    job_manager: BatchJobManager,
+    pdf_files: List[Path],
+    config: Config,
+    logger: logging.Logger,
+):
+    remaining = list(pdf_files)
+
+    while True:
+        job_manager.sync_from_remote(processor.client)
+        active_before = len(job_manager.get_active_jobs())
+        logger.info(
+            f"自动调度轮次开始: 剩余 PDF {len(remaining)} 个，当前活跃 Batch Job {active_before}/{config.max_active_batch_jobs}。"
+        )
+
+        while remaining and len(job_manager.get_active_jobs()) < config.max_active_batch_jobs:
+            pdf_path = remaining[0]
+            _, fully_submitted = processor.submit_pdf_batch_jobs(
+                pdf_path,
+                job_manager,
+                allow_wait_for_slot=False,
+            )
+            if fully_submitted:
+                remaining.pop(0)
+            else:
+                break
+
+        job_manager.sync_from_remote(processor.client)
+        active_count = len(job_manager.get_active_jobs())
+
+        if not remaining and active_count == 0:
+            logger.info("自动调度完成: 无剩余 PDF，且无活跃 Batch Job。")
+            break
+
+        logger.info(
+            f"自动调度中: 剩余 PDF {len(remaining)} 个，活跃 Batch Job {active_count} 个，"
+            f"等待 {config.poll_interval} 秒后继续。"
+        )
+        time.sleep(config.poll_interval)
+
+    for pdf_path in pdf_files:
+        save_batch_markdown(processor, pdf_path, job_manager, config, logger)
     logger.info("Token 使用统计")
     logger.info(f"  请求数: {request_count}")
     logger.info(f"  Input tokens:    {prompt_tokens:,}")
@@ -908,6 +1144,8 @@ def main():
     parser.add_argument("--batch-size", type=int, help="每批最大页数 (默认: 50)")
     parser.add_argument("--status", action="store_true", help="显示所有 Batch Job 状态")
     parser.add_argument("--download", action="store_true", help="下载已完成的 Batch 结果并合并")
+    parser.add_argument("--cleanup-all-jobs", action="store_true", help="取消并删除状态文件中记录的所有 Batch Job")
+    parser.add_argument("--max-active-batch-jobs", type=int, help="限制同时处于 pending/running 的 Batch Job 数")
     args = parser.parse_args()
     
     config = Config()
@@ -918,6 +1156,8 @@ def main():
         config.wait_for_completion = False
     if args.batch_size:
         config.batch_size = args.batch_size
+    if args.max_active_batch_jobs:
+        config.max_active_batch_jobs = args.max_active_batch_jobs
     
     logger = setup_logging(config.logs_dir)
     
@@ -934,6 +1174,12 @@ def main():
             logger.info(f"已同步 {sync_result['synced']} 个 job 状态")
         print_job_status(job_manager, logger)
         sys.exit(0)
+
+    if args.cleanup_all_jobs:
+        job_manager = BatchJobManager(config.batch_status_file)
+        client = genai.Client(api_key=config.gemini_api_key)
+        cleanup_all_batch_jobs(job_manager, client, logger)
+        sys.exit(0)
     
     mode = "实时 API" if not config.use_batch_api else "Batch API"
     logger.info("=" * 60)
@@ -942,6 +1188,7 @@ def main():
     logger.info(f"主语言: {config.primary_language}")
     if config.use_batch_api:
         logger.info(f"每批页数: {config.batch_size}")
+        logger.info(f"最大活跃 Batch Job 数: {config.max_active_batch_jobs}")
         logger.info(f"等待完成: {'是' if config.wait_for_completion else '否'}")
     logger.info(f"输入目录: {config.input_dir}")
     logger.info(f"输出目录: {config.output_dir}")
@@ -982,44 +1229,20 @@ def main():
                 logger.info(f"已同步 {sync_result['synced']} 个 job 状态")
             
             for pdf_path in pdf_files:
-                jobs = job_manager.get_all_jobs_for_pdf(pdf_path.name)
-                if not jobs:
-                    logger.warning(f"{pdf_path.name}: 无 Batch Job 记录")
-                    continue
-                
-                total_pages = sum(j['page_end'] - j['page_start'] + 1 for j in jobs)
-                markdown_content, usage = processor.collect_batch_results(pdf_path, job_manager, total_pages)
-                
-                output_path = config.output_dir / f"{pdf_path.stem}.md"
-                with open(output_path, 'w', encoding='utf-8') as f:
-                    f.write(f"# {pdf_path.stem}\n\n")
-                    f.write(f"*OCR processed on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n")
-                    f.write(f"*Model: {config.model_name} (Batch API)*\n\n")
-                    f.write("---\n\n")
-                    f.write(markdown_content)
-                
-                logger.info(f"已保存: {output_path}")
-                _log_usage_stats(logger, usage, config.model_name)
+                save_batch_markdown(processor, pdf_path, job_manager, config, logger)
         else:
-            for pdf_path in pdf_files:
-                try:
-                    result = processor.process_pdf_batch(pdf_path, job_manager)
-                    
-                    if result:
-                        markdown_content, usage = result
-                        output_path = config.output_dir / f"{pdf_path.stem}.md"
-                        with open(output_path, 'w', encoding='utf-8') as f:
-                            f.write(f"# {pdf_path.stem}\n\n")
-                            f.write(f"*OCR processed on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n")
-                            f.write(f"*Model: {config.model_name} (Batch API)*\n\n")
-                            f.write("---\n\n")
-                            f.write(markdown_content)
-                        logger.info(f"已保存: {output_path}")
-                        _log_usage_stats(logger, usage, config.model_name)
-                    
-                except Exception as e:
-                    logger.error(f"处理 {pdf_path.name} 时出错: {e}")
-                    continue
+            if config.wait_for_completion:
+                run_batch_automation(processor, job_manager, pdf_files, config, logger)
+            else:
+                for pdf_path in pdf_files:
+                    try:
+                        processor.process_pdf_batch(pdf_path, job_manager)
+                        if processor.queue_limit_reached:
+                            logger.info("已达到活跃 Batch Job 上限，本轮停止继续提交新任务")
+                            break
+                    except Exception as e:
+                        logger.error(f"处理 {pdf_path.name} 时出错: {e}")
+                        continue
         
         print_job_status(job_manager, logger)
         

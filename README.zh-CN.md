@@ -60,6 +60,7 @@
    - `MODEL_NAME`: 使用的模型，默认为 `gemini-3.1-flash-lite-preview`。
    - `PRIMARY_LANGUAGE`: 主要识别语言（如 Arabic, Chinese, English）。
    - `BATCH_SIZE`: Batch 模式下每批处理的页数（建议 50）。
+   - `MAX_ACTIVE_BATCH_JOBS`: 同时允许处于 `PENDING/RUNNING` 的 Batch Job 数量上限（建议 10-30，默认 20）。
 
 ### 默认模型与 Batch 定价
 
@@ -103,6 +104,7 @@ python batch_ocr.py --realtime
   ```bash
   python batch_ocr.py --no-wait
   ```
+  现在这个模式会采用“补位提交”策略：只补到 `MAX_ACTIVE_BATCH_JOBS` 上限就退出，不再一次性把所有文件全提交上去。后面再运行一次即可继续补交剩余任务。
 - **查看任务状态**：
   ```bash
   python batch_ocr.py --status
@@ -120,6 +122,14 @@ python batch_ocr.py --realtime
 - **重置状态（从头开始）**：
   ```bash
   python batch_ocr.py --reset
+  ```
+- **限制本轮活跃 Batch Job 数**：
+  ```bash
+  python batch_ocr.py --no-wait --max-active-batch-jobs 15
+  ```
+- **取消并删除当前记录里的所有 Batch Job**：
+  ```bash
+  python batch_ocr.py --cleanup-all-jobs
   ```
 
 ---
@@ -157,6 +167,9 @@ python batch_ocr.py --realtime
 
 **Q: 为什么推荐使用 Batch API？**
 A: 除了 50% 的价格优惠外，Batch API 拥有更高的配额限制，能够同时处理数千页文档而不会触发现流限制。
+
+**Q: 为什么 `--no-wait` 现在不再一次性提交完所有任务？**
+A: Gemini Batch API 本身有并发 Batch Job 上限，系统负载高时队列等待也会明显变长。把活跃任务数控住，会比“一把全交”更稳。
 
 **Q: 这个脚本现在怎么估算成本？**
 A: 脚本会按上面的 Batch 价格表估算，并把 thinking tokens 一起计入 output 成本，和当前 Gemini 官方定价口径保持一致。

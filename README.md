@@ -60,6 +60,7 @@ This tool leverages Gemini's powerful vision capabilities to accurately recogniz
    - `MODEL_NAME`: Model to use, defaults to `gemini-3.1-flash-lite-preview`.
    - `PRIMARY_LANGUAGE`: Primary recognition language (e.g., Arabic, Chinese, English).
    - `BATCH_SIZE`: Pages per batch in Batch mode (recommended: 50).
+   - `MAX_ACTIVE_BATCH_JOBS`: Max number of batch jobs allowed to stay in `PENDING/RUNNING` at the same time (recommended: 10-30, default: 20).
 
 ### Default Model And Batch Pricing
 
@@ -103,6 +104,7 @@ For large-scale tasks, execute in separate steps:
   ```bash
   python batch_ocr.py --no-wait
   ```
+  This mode now uses a "top-up" strategy: it submits new work only until the active Batch job count reaches `MAX_ACTIVE_BATCH_JOBS`, then exits. Run it again later to continue submitting the rest.
 - **Check job status**:
   ```bash
   python batch_ocr.py --status
@@ -124,6 +126,14 @@ For large-scale tasks, execute in separate steps:
 - **Custom batch size**:
   ```bash
   python batch_ocr.py --batch-size 30
+  ```
+- **Limit active Batch jobs for this run**:
+  ```bash
+  python batch_ocr.py --no-wait --max-active-batch-jobs 15
+  ```
+- **Cancel and delete all tracked Batch jobs**:
+  ```bash
+  python batch_ocr.py --cleanup-all-jobs
   ```
 
 ---
@@ -161,6 +171,9 @@ For large-scale tasks, execute in separate steps:
 
 **Q: Why use Batch API?**
 A: Besides 50% price discount, Batch API has higher quota limits, enabling processing of thousands of pages simultaneously without hitting rate limits.
+
+**Q: Why doesn't `--no-wait` submit everything at once anymore?**
+A: The Gemini Batch API has a concurrent batch job limit and queue latency can increase sharply under load. The script now caps active `PENDING/RUNNING` jobs and lets you top up later, which is safer for large OCR queues.
 
 **Q: How does this script estimate token cost?**
 A: The script uses the Batch API price table above and counts thinking tokens as part of output cost, matching the current Gemini pricing model.
