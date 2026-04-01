@@ -77,7 +77,7 @@ class Config:
         self.use_batch_api = True  # 默认使用 Batch API
         self.batch_size = int(os.getenv("BATCH_SIZE", "50"))  # 每批最大页数
         self.poll_interval = int(os.getenv("POLL_INTERVAL", "30"))  # 轮询间隔(秒)
-        self.max_active_batch_jobs = int(os.getenv("MAX_ACTIVE_BATCH_JOBS", "20"))  # 同时挂起/运行的最大 Batch Job 数
+        self.max_active_batch_jobs = _optional_int_env("MAX_ACTIVE_BATCH_JOBS")  # 同时挂起/运行的最大 Batch Job 数，默认不启用
         self.wait_for_completion = True  # 是否等待完成
         
         # Batch API 目录
@@ -615,6 +615,9 @@ class GeminiOCRProcessor:
             active_count = len(job_manager.get_active_jobs())
             limit = self.config.max_active_batch_jobs
 
+            if limit is None or limit <= 0:
+                return True
+
             if active_count < limit:
                 return True
 
@@ -1004,6 +1007,13 @@ BATCH_PRICING = {
 }
 
 
+def _optional_int_env(name: str) -> Optional[int]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return None
+    return int(raw)
+
+
 def _resolve_batch_pricing(model_name: str, prompt_tokens: int) -> Tuple[Optional[Dict[str, float]], Optional[str]]:
     pricing = BATCH_PRICING.get(model_name)
     if not pricing:
@@ -1079,11 +1089,15 @@ def run_batch_automation(
     while True:
         job_manager.sync_from_remote(processor.client)
         active_before = len(job_manager.get_active_jobs())
+        limit_label = str(config.max_active_batch_jobs) if config.max_active_batch_jobs else "未启用"
         logger.info(
-            f"自动调度轮次开始: 剩余 PDF {len(remaining)} 个，当前活跃 Batch Job {active_before}/{config.max_active_batch_jobs}。"
+            f"自动调度轮次开始: 剩余 PDF {len(remaining)} 个，当前活跃 Batch Job {active_before}/{limit_label}。"
         )
 
-        while remaining and len(job_manager.get_active_jobs()) < config.max_active_batch_jobs:
+        while remaining and (
+            config.max_active_batch_jobs is None
+            or len(job_manager.get_active_jobs()) < config.max_active_batch_jobs
+        ):
             pdf_path = remaining[0]
             _, fully_submitted = processor.submit_pdf_batch_jobs(
                 pdf_path,
@@ -1188,7 +1202,10 @@ def main():
     logger.info(f"主语言: {config.primary_language}")
     if config.use_batch_api:
         logger.info(f"每批页数: {config.batch_size}")
-        logger.info(f"最大活跃 Batch Job 数: {config.max_active_batch_jobs}")
+        if config.max_active_batch_jobs:
+            logger.info(f"最大活跃 Batch Job 数: {config.max_active_batch_jobs}")
+        else:
+            logger.info("最大活跃 Batch Job 数: 未启用")
         logger.info(f"等待完成: {'是' if config.wait_for_completion else '否'}")
     logger.info(f"输入目录: {config.input_dir}")
     logger.info(f"输出目录: {config.output_dir}")

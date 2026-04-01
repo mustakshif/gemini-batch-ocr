@@ -1,16 +1,21 @@
-# Gemini Batch PDF OCR
+# Gemini/Vertex Batch PDF OCR
 
 [中文文档](README.zh-CN.md)
 
-A batch PDF OCR tool that now defaults to Google `gemini-3.1-flash-lite-preview`, designed for converting scanned PDF documents into high-quality Markdown format at lower Batch API cost. See [benchmark results](https://github.com/mustakshif/arabic-ocr-benchmark-tool?tab=readme-ov-file#benchmark-results) for model comparison.
+A batch PDF OCR tool for scanned documents, now with two backends:
+
+- Gemini Developer API script: `batch_ocr.py`
+- Vertex AI script: `vertex_ocr.py`
+
+Both can convert PDFs to Markdown and support real-time + batch workflows. See [benchmark results](https://github.com/mustakshif/arabic-ocr-benchmark-tool?tab=readme-ov-file#benchmark-results) for model comparison.
 
 ## Overview
 
 This tool leverages Gemini's powerful vision capabilities to accurately recognize complex document structures and multiple languages (with special optimization for Arabic and other RTL scripts).
 
 **Key Advantages:**
-- **Batch API Support**: Uses Google Gemini Batch API for **50% cost savings** compared to real-time API, ideal for large-scale document processing.
-- **Cost-Efficient OCR**: Defaults to Gemini 3.1 Flash-Lite Preview for high-volume OCR, while still allowing you to switch to higher-end Gemini models when needed.
+- **Dual Backend Support**: Keep the existing Gemini Developer path and add a Vertex path without migration risk.
+- **Batch API Cost Savings**: Both backends can run batch workflows for large, non-urgent OCR jobs.
 - **Robustness**: Built-in checkpoint recovery, retry mechanism, and concurrency control.
 
 ---
@@ -60,7 +65,20 @@ This tool leverages Gemini's powerful vision capabilities to accurately recogniz
    - `MODEL_NAME`: Model to use, defaults to `gemini-3.1-flash-lite-preview`.
    - `PRIMARY_LANGUAGE`: Primary recognition language (e.g., Arabic, Chinese, English).
    - `BATCH_SIZE`: Pages per batch in Batch mode (recommended: 50).
-   - `MAX_ACTIVE_BATCH_JOBS`: Max number of batch jobs allowed to stay in `PENDING/RUNNING` at the same time (recommended: 10-30, default: 20).
+   - `MAX_ACTIVE_BATCH_JOBS`: Optional cap for how many batch jobs may stay in `PENDING/RUNNING` at the same time. Disabled by default; when needed, a practical range is 10-30.
+
+3. If you use `vertex_ocr.py`, also configure:
+   - `GOOGLE_CLOUD_PROJECT`
+   - `GOOGLE_CLOUD_LOCATION` (for example `global`)
+   - `VERTEX_MODEL_NAME` (for example `gemini-2.5-flash-lite`)
+   - `VERTEX_GCS_BUCKET`
+   - `VERTEX_GCS_PREFIX` (optional)
+   - `VERTEX_API_KEY` (optional, real-time mode only)
+
+Important auth note for Vertex:
+- Real-time mode can use `VERTEX_API_KEY`.
+- Batch mode uses `ADC + project/location` and ignores `VERTEX_API_KEY`.
+- Batch mode needs IAM permission such as `aiplatform.batchPredictionJobs.create` and GCS read/write permissions.
 
 ### Default Model And Batch Pricing
 
@@ -138,6 +156,48 @@ For large-scale tasks, execute in separate steps:
 
 ---
 
+## Vertex Usage (`vertex_ocr.py`)
+
+Place PDF files in `input/` as usual.
+
+### 1. Standard Run (Vertex Batch)
+```bash
+python vertex_ocr.py
+```
+
+### 2. Real-time Mode
+```bash
+python vertex_ocr.py --realtime
+```
+
+### 3. Async Workflow
+```bash
+python vertex_ocr.py --no-wait
+python vertex_ocr.py --status
+python vertex_ocr.py --download
+```
+
+### 4. Cleanup Commands
+- **Cancel and delete tracked Vertex Batch jobs**:
+  ```bash
+  python vertex_ocr.py --cleanup-all-jobs
+  ```
+- **Delete tracked GCS input/output artifacts**:
+  ```bash
+  python vertex_ocr.py --cleanup-gcs-artifacts
+  ```
+- **Clean one file's artifacts only**:
+  ```bash
+  python vertex_ocr.py --file example.pdf --cleanup-gcs-artifacts
+  ```
+
+Note:
+- `--cleanup-all-jobs` removes Vertex job resources.
+- `--cleanup-gcs-artifacts` removes objects in GCS prefixes tracked by local job state.
+- GCS objects are not auto-deleted after job completion unless you clean them or configure bucket lifecycle rules.
+
+---
+
 ## Workflow (Batch API)
 
 ```
@@ -184,6 +244,12 @@ A: Final Markdown files are saved in `output/`. Logs and intermediate states are
 **Q: What if some pages fail OCR?**
 A: The tool retries automatically. If still failing, an HTML comment with error info is inserted in the Markdown for manual review.
 
+**Q: Is Vertex script really running in batch mode?**
+A: Yes. `vertex_ocr.py` batch path uses Vertex Batch jobs (`client.batches.create`) with GCS input/output.
+
+**Q: Does Vertex batch output in GCS auto-clean itself?**
+A: No. Use `--cleanup-gcs-artifacts` or configure Cloud Storage lifecycle rules.
+
 ---
 
 ## Project Structure
@@ -194,6 +260,7 @@ gemini-batch-ocr/
 ├── output/             # Markdown output
 ├── logs/               # Processing logs and status
 ├── batch_ocr.py        # Main script
+├── vertex_ocr.py       # Vertex AI script
 ├── config.example.env  # Configuration template
 └── requirements.txt    # Python dependencies
 ```
