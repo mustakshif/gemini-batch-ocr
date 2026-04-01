@@ -24,6 +24,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -126,13 +127,17 @@ class Config:
     gcs_prefix: str
     model_name: str
     dpi: int
+    pdf_render_threads: int
     max_retries: int
     retry_delay: float
     request_delay: float
     poll_interval: int
     max_active_batch_jobs: Optional[int]
+    gcs_upload_workers: int
     primary_language: str
     ocr_prompt: str
+    ocr_prompt_after_meta_pages: str
+    ocr_meta_page_limit: int
 
     @classmethod
     def load(cls) -> "Config":
@@ -172,13 +177,20 @@ class Config:
             ),
             model_name=model_name,
             dpi=int(os.getenv("PDF_DPI", "200")),
+            pdf_render_threads=max(1, int(os.getenv("PDF_RENDER_THREADS", "4"))),
             max_retries=int(os.getenv("MAX_RETRIES", "3")),
             retry_delay=float(os.getenv("RETRY_DELAY", "5")),
             request_delay=float(os.getenv("REQUEST_DELAY", "1.5")),
             poll_interval=int(os.getenv("POLL_INTERVAL", "30")),
             max_active_batch_jobs=_optional_int_env("MAX_ACTIVE_BATCH_JOBS"),
+            gcs_upload_workers=max(1, int(os.getenv("GCS_UPLOAD_WORKERS", "6"))),
             primary_language=primary_language,
             ocr_prompt=os.getenv("OCR_PROMPT", cls.default_prompt(primary_language)),
+            ocr_prompt_after_meta_pages=os.getenv(
+                "OCR_PROMPT_AFTER_META_PAGES",
+                os.getenv("OCR_PROMPT", cls.default_prompt(primary_language)),
+            ),
+            ocr_meta_page_limit=max(0, int(os.getenv("OCR_META_PAGE_LIMIT", "10"))),
         )
 
     @staticmethod
@@ -223,6 +235,11 @@ Output the Markdown content only, nothing else."""
             return False
 
         return True
+
+    def prompt_for_page(self, page_num: int) -> str:
+        if self.ocr_meta_page_limit > 0 and page_num > self.ocr_meta_page_limit:
+            return self.ocr_prompt_after_meta_pages
+        return self.ocr_prompt
 
 
 class StatusManager:
@@ -440,8 +457,15 @@ class VertexOCRProcessor:
         self.storage_client = storage.Client(project=config.vertex_project)
 
     def pdf_to_images(self, pdf_path: Path) -> List[Image.Image]:
-        self.logger.info(f"转换 PDF 为图片: {pdf_path.name}")
-        images = convert_from_path(pdf_path, dpi=self.config.dpi, fmt="PNG")
+        self.logger.info(
+            f"转换 PDF 为图片: {pdf_path.name} (DPI={self.config.dpi}, threads={self.config.pdf_render_threads})"
+        )
+        images = convert_from_path(
+            pdf_path,
+            dpi=self.config.dpi,
+            fmt="PNG",
+            thread_count=self.config.pdf_render_threads,
+        )
         self.logger.info(f"共 {len(images)} 页")
         return images
 
@@ -453,13 +477,14 @@ class VertexOCRProcessor:
     def ocr_single_page(self, image: Image.Image, page_num: int) -> Tuple[int, str, Optional[str]]:
         for attempt in range(self.config.max_retries):
             try:
+                prompt = self.config.prompt_for_page(page_num)
                 response = self.client.models.generate_content(
                     model=self.config.model_name,
                     contents=[
                         types.Content(
                             role="user",
                             parts=[
-                                types.Part(text=self.config.ocr_prompt),
+                                types.Part(text=prompt),
                                 types.Part.from_bytes(
                                     data=self.image_to_bytes(image),
                                     mime_type="image/png",
@@ -554,6 +579,42 @@ class VertexOCRProcessor:
         blob = bucket.blob(blob_name)
         blob.upload_from_string(data, content_type=content_type)
 
+    def _upload_pages_parallel(
+        self,
+        images: List[Image.Image],
+        input_root: str,
+        pdf_name: str,
+    ) -> Dict[int, str]:
+        page_uri_by_page: Dict[int, str] = {}
+        workers = max(1, self.config.gcs_upload_workers)
+        self.logger.info(f"上传 {pdf_name} 的页面图片到 GCS（并发={workers}）")
+
+        def upload_one(page_num: int, image: Image.Image) -> Tuple[int, str]:
+            page_uri = f"{input_root}/pages/page_{page_num:04d}.png"
+            image_bytes = self.image_to_bytes(image)
+            for attempt in range(self.config.max_retries):
+                try:
+                    self._upload_to_gcs(page_uri, image_bytes, "image/png")
+                    return page_num, page_uri
+                except Exception:
+                    if attempt >= self.config.max_retries - 1:
+                        raise
+                    time.sleep(self.config.retry_delay * (attempt + 1))
+            raise RuntimeError(f"页面 {page_num} 上传失败")
+
+        with tqdm(total=len(images), desc=f"{pdf_name} 上传", unit="页") as progress:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [
+                    executor.submit(upload_one, page_num, image)
+                    for page_num, image in enumerate(images, 1)
+                ]
+                for future in as_completed(futures):
+                    page_num, page_uri = future.result()
+                    page_uri_by_page[page_num] = page_uri
+                    progress.update(1)
+
+        return page_uri_by_page
+
     def _build_batch_artifacts(
         self,
         pdf_path: Path,
@@ -576,20 +637,19 @@ class VertexOCRProcessor:
         )
 
         images = self.pdf_to_images(pdf_path)
-        requests: List[Dict] = []
         request_lines: List[str] = []
+        page_uri_by_page = self._upload_pages_parallel(images, input_root, pdf_name)
 
-        self.logger.info(f"上传 {pdf_name} 的页面图片到 GCS")
-        for page_num, image in enumerate(tqdm(images, desc=f"{pdf_name} 上传", unit="页"), 1):
-            page_uri = f"{input_root}/pages/page_{page_num:04d}.png"
-            self._upload_to_gcs(page_uri, self.image_to_bytes(image), "image/png")
+        for page_num in range(1, len(images) + 1):
+            page_uri = page_uri_by_page[page_num]
+            prompt = self.config.prompt_for_page(page_num)
             request = {
                 "request": {
                     "contents": [
                         {
                             "role": "user",
                             "parts": [
-                                {"text": self.config.ocr_prompt},
+                                {"text": prompt},
                                 {
                                     "fileData": {
                                         "fileUri": page_uri,
@@ -601,7 +661,6 @@ class VertexOCRProcessor:
                     ]
                 }
             }
-            requests.append(request)
             request_lines.append(json.dumps(request, ensure_ascii=False))
 
         local_request_path = self.config.batch_requests_dir / f"{safe_pdf_id}_requests.jsonl"
@@ -614,7 +673,7 @@ class VertexOCRProcessor:
             "application/jsonl",
         )
         self.logger.info(f"已上传 Batch 请求文件: {input_uri}")
-        return input_uri, output_prefix, len(requests)
+        return input_uri, output_prefix, len(request_lines)
 
     def submit_pdf_batch_job(
         self,
@@ -630,23 +689,52 @@ class VertexOCRProcessor:
         display_name = f"{_safe_ascii_name(pdf_path.stem)}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
         self.logger.info(f"提交 Vertex Batch Job: {pdf_path.name}")
-        try:
-            batch_job = self.client.batches.create(
-                model=self.config.model_name,
-                src=input_uri,
-                config=types.CreateBatchJobConfig(
-                    display_name=display_name,
-                    dest=output_prefix,
-                ),
-            )
-        except Exception as exc:
-            msg = str(exc)
-            if "aiplatform.batchPredictionJobs.create" in msg:
-                raise RuntimeError(
-                    "缺少 Vertex Batch 创建权限。请使用 ADC 凭证并给当前账号/服务账号授予 "
-                    "`aiplatform.batchPredictionJobs.create`（如 `roles/aiplatform.user`）后重试。"
-                ) from exc
-            raise
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.config.max_retries + 1):
+            try:
+                batch_job = self.client.batches.create(
+                    model=self.config.model_name,
+                    src=input_uri,
+                    config=types.CreateBatchJobConfig(
+                        display_name=display_name,
+                        dest=output_prefix,
+                    ),
+                )
+                break
+            except Exception as exc:
+                msg = str(exc)
+                if "aiplatform.batchPredictionJobs.create" in msg:
+                    raise RuntimeError(
+                        "缺少 Vertex Batch 创建权限。请使用 ADC 凭证并给当前账号/服务账号授予 "
+                        "`aiplatform.batchPredictionJobs.create`（如 `roles/aiplatform.user`）后重试。"
+                    ) from exc
+
+                last_error = exc
+                transient_markers = (
+                    "ConnectError",
+                    "ReadTimeout",
+                    "RemoteProtocolError",
+                    "Connection reset",
+                    "Connection aborted",
+                    "unexpected eof while reading",
+                    "timed out",
+                )
+                is_transient = any(marker in msg for marker in transient_markers)
+                if (not is_transient) or attempt >= self.config.max_retries:
+                    raise RuntimeError(f"提交 Batch Job 失败: {exc}") from exc
+
+                wait_seconds = self.config.retry_delay * attempt
+                self.logger.warning(
+                    "提交 Batch Job 失败（疑似网络瞬断），重试 %s/%s，%.1f 秒后再试: %s",
+                    attempt,
+                    self.config.max_retries,
+                    wait_seconds,
+                    exc,
+                )
+                time.sleep(wait_seconds)
+
+        if last_error is not None and "batch_job" not in locals():
+            raise RuntimeError(f"提交 Batch Job 失败: {last_error}") from last_error
 
         job_state = _state_name(batch_job.state)
         job_data = {
@@ -1063,20 +1151,24 @@ def main() -> None:
         job_manager.sync_from_remote(processor.client, logger)
 
         if args.download:
-            # 下载模式允许 input/ 为空；此时从状态文件恢复待处理 PDF 列表。
-            if not pdf_files:
-                pdf_files = sorted(config.input_dir / pdf_name for pdf_name, _ in job_manager.all_jobs())
-                if not pdf_files:
-                    logger.warning("下载模式下未找到 Batch Job 记录，无法下载结果")
-                    return
+            # 下载模式默认按状态文件中的 job 记录下载，而不是按当前 input/ 目录过滤。
+            if args.file:
+                target_pdf_names = [pdf_files[0].name]
+            else:
+                target_pdf_names = sorted(pdf_name for pdf_name, _ in job_manager.all_jobs())
 
-            for pdf_path in pdf_files:
-                job = job_manager.get_job(pdf_path.name)
+            if not target_pdf_names:
+                logger.warning("下载模式下未找到 Batch Job 记录，无法下载结果")
+                return
+
+            for pdf_name in target_pdf_names:
+                pdf_path = config.input_dir / pdf_name
+                job = job_manager.get_job(pdf_name)
                 if not job:
-                    logger.warning(f"{pdf_path.name}: 没有 Batch Job 记录")
+                    logger.warning(f"{pdf_name}: 没有 Batch Job 记录")
                     continue
                 if job.get("status") != "JOB_STATE_SUCCEEDED":
-                    logger.warning(f"{pdf_path.name}: 当前状态 {job.get('status')}，暂不下载")
+                    logger.warning(f"{pdf_name}: 当前状态 {job.get('status')}，暂不下载")
                     continue
                 processor.save_batch_markdown(pdf_path, job_manager)
             print_job_status(job_manager, logger)
@@ -1110,10 +1202,15 @@ def main() -> None:
                 if str(exc) == "batch_slot_limit_reached":
                     logger.info("已达到活跃 Batch Job 上限，本轮停止继续提交")
                     break
-                logger.error(str(exc))
-                return
+                logger.error(f"{pdf_name}: {exc}")
+                failed_outputs.add(pdf_name)
+            except Exception as exc:
+                logger.error(f"{pdf_name}: 提交 Batch Job 失败: {exc}")
+                failed_outputs.add(pdf_name)
 
         if args.no_wait:
+            if failed_outputs:
+                logger.warning("本轮有 %s 个文件提交失败，请稍后重试", len(failed_outputs))
             print_job_status(job_manager, logger)
             return
 
@@ -1128,6 +1225,8 @@ def main() -> None:
             active_count = 0
 
             for pdf_name in target_pdf_names:
+                if pdf_name in failed_outputs:
+                    continue
                 job = job_manager.get_job(pdf_name)
                 if not job:
                     unfinished.append(pdf_name)

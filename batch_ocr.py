@@ -88,6 +88,8 @@ class Config:
         # 语言配置
         self.primary_language = os.getenv("PRIMARY_LANGUAGE", "Arabic")
         self.ocr_prompt = os.getenv("OCR_PROMPT", self._default_prompt())
+        self.ocr_prompt_after_meta_pages = os.getenv("OCR_PROMPT_AFTER_META_PAGES", self.ocr_prompt)
+        self.ocr_meta_page_limit = max(0, int(os.getenv("OCR_META_PAGE_LIMIT", "10")))
         
         # 状态文件（实时模式）
         self.status_file = self.logs_dir / "processing_status.csv"
@@ -126,6 +128,11 @@ Output the Markdown content only, nothing else."""
             dir_path.mkdir(parents=True, exist_ok=True)
             
         return True
+
+    def prompt_for_page(self, page_num: int) -> str:
+        if self.ocr_meta_page_limit > 0 and page_num > self.ocr_meta_page_limit:
+            return self.ocr_prompt_after_meta_pages
+        return self.ocr_prompt
 
 
 # ============================================================================
@@ -452,6 +459,7 @@ class GeminiOCRProcessor:
         for attempt in range(self.config.max_retries):
             try:
                 image_bytes = self.image_to_bytes(image)
+                prompt = self.config.prompt_for_page(page_num)
                 
                 response = self.client.models.generate_content(
                     model=self.config.model_name,
@@ -459,7 +467,7 @@ class GeminiOCRProcessor:
                         types.Content(
                             role="user",
                             parts=[
-                                types.Part(text=self.config.ocr_prompt),
+                                types.Part(text=prompt),
                                 types.Part.from_bytes(data=image_bytes, mime_type="image/png")
                             ]
                         )
@@ -558,12 +566,13 @@ class GeminiOCRProcessor:
     
     def prepare_batch_request(self, image: Image.Image, safe_pdf_id: str, page_num: int) -> Dict:
         image_b64 = self.image_to_base64(image)
+        prompt = self.config.prompt_for_page(page_num)
         return {
             "key": f"{safe_pdf_id}_page_{page_num:04d}",
             "request": {
                 "contents": [{
                     "parts": [
-                        {"text": self.config.ocr_prompt},
+                        {"text": prompt},
                         {"inline_data": {"mime_type": "image/png", "data": image_b64}}
                     ],
                     "role": "user"
